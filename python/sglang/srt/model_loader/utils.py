@@ -4,7 +4,7 @@
 import contextlib
 import logging
 from typing import Tuple, Type
-
+import netifaces
 import torch
 import transformers
 from torch import nn
@@ -117,3 +117,7 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()
+
+
+def get_eth0_ip():
+    return netifaces.ifaddresses('eth0')[netifaces.AF_INET][0]['addr']

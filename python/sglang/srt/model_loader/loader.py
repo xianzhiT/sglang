@@ -16,6 +16,7 @@ import re
 import socket
 import threading
 import time
+import traceback
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -647,12 +648,6 @@ class ShardedStateLoader(BaseModelLoader):
             else load_config.model_loader_extra_config.copy()
         )
         self.pattern = extra_config.pop("pattern", self.DEFAULT_PATTERN)
-        if extra_config:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{load_config.model_loader_extra_config.keys()}"
-            )
 
     @staticmethod
     def _filter_subtensors(tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1394,11 +1389,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
@@ -1412,12 +1402,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         logger.info("Loading weights from remote instance ...")
         load_config = self.load_config
 
+        seed_instance_ip = self.load_config.model_loader_extra_config['seed_instance_ip']
+        send_weights_group_ports = self.load_config.model_loader_extra_config['send_weights_group_ports']
+
         assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
             f"Model loader {self.load_config.load_format} is not supported for "
             f"load format {load_config.load_format}"
         )
 
-        model_weights = f"instance://{model_config.remote_instance_weight_loader_seed_instance_ip}:{model_config.remote_instance_weight_loader_send_weights_group_ports[model_config.tp_rank]}"
+        model_weights = f"instance://{seed_instance_ip}:{send_weights_group_ports[model_config.tp_rank]}"
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -1452,40 +1445,75 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
         )
 
+        seed_instance_ip = self.load_config.model_loader_extra_config['seed_instance_ip']
+        seed_instance_service_port = self.load_config.model_loader_extra_config['seed_instance_service_port']
+        send_weights_group_ports = self.load_config.model_loader_extra_config['send_weights_group_ports']
+
+        def trigger_send_weights_to_remote_instance_request():
+            seed_instance_service_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
+            try:
+                requests.post(
+                    f"{seed_instance_service_url}/send_weights_to_remote_instance",
+                    json={
+                        "master_address": seed_instance_ip,
+                        "ports": (
+                            ",".join(
+                                str(p) for p in send_weights_group_ports
+                            )
+                        ),
+                        "group_name": f"send_weights_{instance_ip}",
+                        "is_draft_model": model_config.is_draft_model
+                    },
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to trigger send weights to remote instance request: {e}"
+                )
+                logger.error(traceback.format_exc())
+                raise
+
         if model_config.tp_rank == 0:
-            t = threading.Thread(
-                target=trigger_transferring_weights_request,
-                args=(
-                    model_config.remote_instance_weight_loader_seed_instance_ip,
-                    model_config.remote_instance_weight_loader_seed_instance_service_port,
-                    model_config.remote_instance_weight_loader_send_weights_group_ports,
-                    instance_ip,
-                ),
-            )
+            t = threading.Thread(target=trigger_send_weights_to_remote_instance_request)
             t.start()
 
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in model.named_parameters():
-                torch.distributed.broadcast(
-                    tensor.data,
-                    src=0,
-                    group=client._model_update_group,
-                )
-            torch.cuda.synchronize()
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    target_device = torch.device(device_config.device)
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
 
-            if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
+            params_dict = dict(model.named_parameters())
+            weight_names = []
+            for name, tensor in model.named_parameters():
+                # if model_config.tp_rank == 0:
+                #     logger.info(f"{name}: {tensor.shape}")
+                weights = client.load_weights_from_remote_instance(
+                    name, tensor.dtype, tensor.shape
+                )
+                weight_names.append(name)
+                default_weight_loader(params_dict[name], weights)
+
+            post_load_weights(model, model_config)
+        torch.cuda.synchronize()
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
         )
+        if model_config.tp_rank == 0:
+            t.join()
         # destroy the process group after loading weights
         torch.distributed.distributed_c10d.destroy_process_group(
             client._model_update_group
         )
         torch.cuda.empty_cache()
-
 
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""

@@ -26,6 +26,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
+import random
+import traceback
 
 import requests
 import torch
@@ -103,7 +105,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.utils import set_default_torch_dtype, get_eth0_ip
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
     create_offloader_from_server_args,
@@ -705,6 +707,24 @@ class ModelRunner:
         )
         return min_per_gpu_memory
 
+    def register_to_hml_master_server(self, server_args, port):
+        hml_master_server_url = os.getenv("HML_MASTER_SERVER")
+        try:
+            requests.post(
+                f"{hml_master_server_url}/register_sglang_server",
+                json={
+                    "server_ip": get_eth0_ip(),
+                    "server_port": port,
+                    "server_args": server_args
+                },
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to register sglang server to hml master server: {e}"
+            )
+            logger.error(traceback.format_exc())
+            raise
+
     def load_model(self):
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
@@ -745,10 +765,12 @@ class ModelRunner:
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
-                        self.server_args.remote_instance_weight_loader_seed_instance_ip,
-                        self.server_args.remote_instance_weight_loader_seed_instance_service_port,
-                        self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+                        self.load_config.model_loader_extra_config["seed_instance_ip"],
+                        self.load_config.model_loader_extra_config["seed_instance_service_port"],
+                        self.load_config.model_loader_extra_config["send_weights_group_ports"],
                         instance_ip,
+                        # TODO(xianzhitang): 补充参数，填入is_draft_model
+                        self.model_config.is_draft_model,
                     ),
                 )
                 t.start()
@@ -764,6 +786,17 @@ class ModelRunner:
                 load_config=self.load_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+        if self.tp_rank == 0:
+            try:
+                server_args = {
+                    # TODO: (xianzhitang) 会有bug，并行策略需要完全一致的情况才能够命中
+                    "tp_size": self.server_args.tp_size,
+                    "served_model_name": self.server_args.served_model_name,
+                }
+                self.register_to_hml_master_server(server_args, self.server_args.port)
+            except Exception as e:
+                logger.warning(f"Fail to register instance to HML:{e}")
+
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -962,7 +995,7 @@ class ModelRunner:
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
-        if self._weights_send_group[group_name] is not None:
+        if self._weights_send_group.get(group_name) is not None:
             send_group = self._weights_send_group[group_name]
         else:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
@@ -973,7 +1006,9 @@ class ModelRunner:
         success = False
         message = ""
         try:
-            for _, weights in self.model.named_parameters():
+            for name, weights in self.model.named_parameters():
+                # if self.tp_rank == 0:
+                #     logger.info(f"{name}: {weights.shape}")
                 torch.distributed.broadcast(
                     weights,
                     src=0,

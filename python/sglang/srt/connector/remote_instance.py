@@ -67,6 +67,29 @@ class RemoteInstanceConnector(BaseConnector):
             logger.error(message)
             return False, message
 
+    def load_weights_from_remote_instance(self, name, dtype, shape):
+        target_dtype = (
+            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+        )
+
+        assert (
+            self._model_update_group is not None
+        ), "model update group must be initialized"
+
+        try:
+            weights = torch.empty(shape, dtype=target_dtype, device=self.device_id)
+            dist.broadcast(weights, src=0, group=self._model_update_group)
+            return weights
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to load weights from remote instance: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
     # Implemented as a no-op to make BaseConnector interface consistent.
     def pull_files(
         self,

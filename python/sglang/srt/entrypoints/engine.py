@@ -20,6 +20,7 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -27,6 +28,8 @@ import random
 import signal
 import threading
 import time
+import requests
+import traceback
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -62,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
@@ -268,7 +272,7 @@ class Engine(EngineBase):
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size - 1}]"
                 )
 
         logger.debug(f"data_parallel_rank: {data_parallel_rank}")
@@ -730,6 +734,81 @@ def _init_tokenizer_manager(
     return tokenizer_manager, template_manager
 
 
+# 从HML获取种子节点信息
+def get_seed_sglang_server(server_args: ServerArgs):
+    # TODO: 如果没有设置MASTER_SERVER环境变量，报错
+    hml_master_server_url = os.getenv("HML_MASTER_SERVER")
+    try:
+        args = {
+            "tp_size": server_args.tp_size,
+            "served_model_name": server_args.served_model_name,
+        }
+        response = requests.post(
+            f"{hml_master_server_url}/get_seed_sglang_server",
+            json={
+                "server_args": args,
+            },
+        ).json()
+        if response["status"] != "success":
+            raise Exception(response["status"])
+
+        return (response["seed_instance_ip"],
+                response["seed_instance_service_port"])
+
+    except Exception as e:
+        logger.error(
+            f"Failed to get seed_sglang_server: {e}"
+        )
+        raise
+
+
+def get_seed_sglang_server_group_ports(server_args: ServerArgs, seed_instance_ip: str, seed_instance_service_port: int):
+    seed_instance_service_url = f"http://{seed_instance_ip}:{seed_instance_service_port}"
+    try:
+        response = requests.post(
+            f"{seed_instance_service_url}/get_send_weights_group_ports",
+            headers={"Authorization": f"Bearer {server_args.api_key}"},
+            json={
+                "num_ports": server_args.tp_size
+            }
+        ).json()
+        logger.info(f"get_send_weights_group_ports {response['send_weights_group_ports']}")
+        return response["send_weights_group_ports"]
+
+    except Exception as e:
+        logger.error(
+            f"Failed to get seed sglang server group ports: {e}"
+        )
+        logger.error(traceback.format_exc())
+        raise
+
+
+def load_weights_from_hml(model_path):
+    try:
+        model_loader_server_url = os.getenv("HML_MODEL_LOADER_SERVER", "http://127.0.0.1:8001")
+        response = requests.post(
+            f"{model_loader_server_url}/load_model",
+            json={
+                "model_path": model_path,
+                "saved_path": "/dev/shm",
+                "force_local": False
+            }).json()
+
+        if int(response["failed_count"]) > 0:
+            message = f"failed weights file count: {response['failed_count']}"
+            raise Exception(message)
+
+        return (response["success_count"],
+                response["failed_count"],
+                response["failed_weight_files"])
+
+    except Exception as e:
+        logger.warning(
+            f"Failed to load weights from hyper model loader: {e}"
+        )
+        raise
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
@@ -750,6 +829,55 @@ def _launch_subprocesses(
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
+
+    # 如果设置了remote instance loader，需要在子进程启动前确认有无种子节点
+    try:
+        seed_instance_ip, seed_instance_service_port = get_seed_sglang_server(server_args)
+        send_weights_group_ports = get_seed_sglang_server_group_ports(server_args, seed_instance_ip,
+                                                                      seed_instance_service_port)
+
+        model_loader_extra_config = json.loads(server_args.model_loader_extra_config)
+        model_loader_extra_config["seed_instance_ip"] = seed_instance_ip
+        model_loader_extra_config["seed_instance_service_port"] = seed_instance_service_port
+        model_loader_extra_config["send_weights_group_ports"] = send_weights_group_ports
+
+        server_args.model_loader_extra_config = json.dumps(model_loader_extra_config)
+    except Exception as e:
+        logger.warning(f"Failed to load from RemoteInstanceModelLoader: {e}，"
+                       f"fallback load from HyperModelLoader.")
+        if "sharded" in server_args.model_path:
+            server_args.load_format = LoadFormat.SHARDED_STATE
+        else:
+            server_args.load_format = LoadFormat.AUTO
+
+    # 如果remote instance loader 失败，尝试走内存从hyper model loader获取
+    if server_args.load_format == LoadFormat.SHARDED_STATE or server_args.load_format == LoadFormat.AUTO:
+        try:
+            from pathlib import Path
+            normalized_model_path = os.path.normpath(server_args.model_path)
+            model_base = os.path.basename(normalized_model_path)
+            target_dir = f"/dev/shm/{model_base}"
+
+            logger.info(f"HyperModelLoader: Loading {server_args.model_path} to {target_dir}...")
+            load_weights_from_hml(server_args.model_path)
+            logger.info(f"HyperModelLoader: Success, change model path to {target_dir}")
+
+            if server_args.speculative_draft_model_path != server_args.model_path:
+                normalized_speculative_model_path = os.path.normpath(server_args.speculative_draft_model_path)
+                speculative_model_base = os.path.basename(normalized_speculative_model_path)
+                speculative_target_dir = f"/dev/shm/{speculative_model_base}"
+
+                logger.info(
+                    f"HyperModelLoader: Loading {server_args.speculative_draft_model_path} to {speculative_target_dir}...")
+                load_weights_from_hml(server_args.speculative_draft_model_path)
+                logger.info(f"HyperModelLoader: Success, change model path to {speculative_target_dir}")
+                server_args.speculative_draft_model_path = speculative_target_dir
+            else:
+                server_args.speculative_draft_model_path = target_dir
+
+            server_args.model_path = target_dir
+        except Exception as e:
+            logger.warning(f"Failed to load weights from HML: {e}, fallback to {server_args.load_format}")
 
     scheduler_procs = []
     if server_args.dp_size == 1:

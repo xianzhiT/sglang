@@ -409,10 +409,6 @@ class ServerArgs:
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
 
-    # Remote instance weight loading
-    remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
-    remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
-    remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -853,13 +849,6 @@ class ServerArgs:
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
 
-        if self.load_format == "remote_instance":
-            if (
-                self.remote_instance_weight_loader_seed_instance_ip is None
-                or self.remote_instance_weight_loader_seed_instance_service_port is None
-                or self.remote_instance_weight_loader_send_weights_group_ports is None
-            ):
-                self.load_format = "auto"
 
         # PD disaggregation
         if self.disaggregation_mode == "decode":
@@ -932,24 +921,6 @@ class ServerArgs:
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
-        )
-        parser.add_argument(
-            "--remote-instance-weight-loader-seed-instance-ip",
-            type=str,
-            default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
-            help="The ip of the seed instance for loading weights from remote instance.",
-        )
-        parser.add_argument(
-            "--remote-instance-weight-loader-seed-instance-service-port",
-            type=int,
-            default=ServerArgs.remote_instance_weight_loader_seed_instance_service_port,
-            help="The service port of the seed instance for loading weights from remote instance.",
-        )
-        parser.add_argument(
-            "--remote-instance-weight-loader-send-weights-group-ports",
-            type=json_list_type,
-            default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
-            help="The communication group ports for loading weights from remote instance.",
         )
         parser.add_argument(
             "--tokenizer-path",

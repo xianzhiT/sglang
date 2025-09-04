@@ -42,6 +42,8 @@ import orjson
 import requests
 import uvicorn
 import uvloop
+import random
+import socket
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
+    GetSendWeightsGroupPortsReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -565,7 +568,7 @@ async def flush_cache():
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -696,6 +699,42 @@ async def init_weights_send_group_for_remote_instance(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/get_send_weights_group_ports")
+async def get_send_weights_group_ports(request: GetSendWeightsGroupPortsReqInput):
+    import random
+
+    min_port = 30000
+    max_port = 65535
+    max_attempts = 1000
+    attempts = 0
+
+    num_ports = request.num_ports
+
+    def is_port_free(port):
+        try:
+            with open("/proc/net/tcp", "r") as f:
+                content = f.readlines()
+            hex_ports = [line.split()[1].split(':')[1] for line in content[1:]]
+            hex_port = '{:04X}'.format(port)
+            return hex_port not in hex_ports
+        except Exception:
+            return False  # conservative fallback
+
+    free_ports = []
+    while attempts < max_attempts:
+        start_port = random.randint(min_port, max_port - num_ports + 1)
+        group = list(range(start_port, start_port + num_ports))
+        if all(is_port_free(p) for p in group):
+            free_ports = group
+            break
+        attempts += 1
+
+    if len(free_ports) < num_ports:
+        logger.error(f"Unable to find {num_ports} free TCP ports after {max_attempts} attempts.")
+
+    return {"send_weights_group_ports": free_ports}
 
 
 @app.post("/send_weights_to_remote_instance")
@@ -1153,10 +1192,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -1380,7 +1419,7 @@ def _execute_server_warmup(
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    i * (2 ** 63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,

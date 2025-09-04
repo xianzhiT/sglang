@@ -1044,6 +1044,13 @@ class InitWeightsSendGroupForRemoteInstanceReqInput:
     # The backend
     backend: str = "nccl"
 
+    is_draft_model: bool = False
+
+@dataclass
+class GetSendWeightsGroupPortsReqInput:
+    # The master address
+    num_ports: int
+
 
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput:
@@ -1059,6 +1066,8 @@ class SendWeightsToRemoteInstanceReqInput:
     ports: str
     # The group name
     group_name: str = "weight_send_group"
+
+    is_draft_model: bool = False
 
 
 @dataclass
