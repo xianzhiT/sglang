@@ -16,6 +16,7 @@ async def async_request_sglang_generate(
     payload,
     url,
     pbar=None,
+    api_key="",
 ):
     """Send a streaming request to the server and collect cache metrics.
 
@@ -23,6 +24,8 @@ async def async_request_sglang_generate(
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         generated_text = ""
         all_output_ids = []
         ttft = 0.0
@@ -93,6 +96,7 @@ async def async_request_openai_chat_completions(
     payload,
     url,
     pbar=None,
+    api_key="",
 ):
     """Send a streaming request to an OpenAI-compatible /v1/chat/completions endpoint.
 
@@ -100,6 +104,9 @@ async def async_request_openai_chat_completions(
     async_request_sglang_generate (except output_ids, which is unavailable).
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         generated_text = ""
         ttft = 0.0
         latency = 0.0
@@ -108,7 +115,7 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            async with session.post(url=url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0

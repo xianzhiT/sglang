@@ -165,6 +165,13 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="API key for bearer auth (optional). If set, requests will include "
+        "'Authorization: Bearer <api_key>' header.",
+    )
     return parser.parse_args()
 
 
@@ -212,6 +219,7 @@ class WorkloadGenerator:
     def __init__(self, args):
         self.api_format = args.api_format
         self.model_path = args.model_path
+        self.api_key = args.api_key
 
         # Construct the base URL and select request/payload functions
         if self.api_format == "openai":
@@ -388,7 +396,9 @@ class WorkloadGenerator:
     async def handle_request(self, item):
         client_id, payload = item
         try:
-            response = await self.request_func(payload, self.url, self.pbar)
+            response = await self.request_func(
+                payload, self.url, self.pbar, api_key=self.api_key
+            )
             if self.pbar.n == self.pbar.total:
                 self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
@@ -547,8 +557,11 @@ class WorkloadGenerator:
         """Send a small heartbeat request to the server."""
         heartbeat_input = [1] * input_len
         payload = gen_payload(heartbeat_input, output_len, self.lora_path)
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            requests.post(self.url, json=payload, timeout=30)
+            requests.post(self.url, json=payload, headers=headers, timeout=30)
         except Exception as e:
             print(f"Heartbeat request failed: {e}")
 
@@ -736,6 +749,9 @@ class WorkloadGenerator:
 if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
+    flush_headers = {}
+    if args.api_key:
+        flush_headers["Authorization"] = f"Bearer {args.api_key}"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -749,7 +765,7 @@ if __name__ == "__main__":
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
+        requests.post(flush_cache_url, headers=flush_headers)
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
