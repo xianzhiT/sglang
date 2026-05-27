@@ -224,6 +224,31 @@ impl PodInfo {
         // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
         format!("http://{}:{}", self.ip, port)
     }
+
+    pub fn summary(&self, port: u16) -> String {
+        format!(
+            "name={} ip={} status={} is_ready={} is_healthy={} pod_type={:?} bootstrap_port={:?} is_router={} mesh_port={:?} worker_url={}",
+            self.name,
+            self.ip,
+            self.status,
+            self.is_ready,
+            self.is_healthy(),
+            self.pod_type,
+            self.bootstrap_port,
+            self.is_router,
+            self.mesh_port,
+            self.worker_url(port),
+        )
+    }
+}
+
+fn tracked_pods_summary(tracked: &HashSet<PodInfo>, port: u16) -> String {
+    let mut pods = tracked
+        .iter()
+        .map(|pod| pod.summary(port))
+        .collect::<Vec<_>>();
+    pods.sort();
+    format!("count={} pods=[{}]", tracked.len(), pods.join("; "))
 }
 
 pub async fn start_service_discovery(
@@ -347,6 +372,13 @@ pub async fn start_service_discovery(
                             if PodInfo::should_include(&pod, &config_inner) {
                                 Some(Ok(pod))
                             } else {
+                                if let Some(pod_info) = PodInfo::from_pod(&pod, Some(&config_inner))
+                                {
+                                    debug!(
+                                        "Ignoring pod because it does not match service discovery selectors: {}",
+                                        pod_info.summary(config_inner.port)
+                                    );
+                                }
                                 None
                             }
                         }
@@ -369,6 +401,12 @@ pub async fn start_service_discovery(
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
 
                         if let Some(pod_info) = pod_info {
+                            info!(
+                                "K8s service discovery pod event: deletion_timestamp_present={} | {}",
+                                pod.metadata.deletion_timestamp.is_some(),
+                                pod_info.summary(port)
+                            );
+
                             if pod.metadata.deletion_timestamp.is_some() {
                                 handle_pod_deletion(
                                     &pod_info,
@@ -428,9 +466,15 @@ async fn handle_pod_event(
 ) {
     let worker_url = pod_info.worker_url(port);
 
+    debug!(
+        "Handling pod event: {} | pd_mode={}",
+        pod_info.summary(port),
+        pd_mode
+    );
+
     if pod_info.is_healthy() {
         // Track whether to add and get count in single lock acquisition
-        let (should_add, tracked_count) = {
+        let (should_add, tracked_count, tracked_before, tracked_after) = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
                 Err(e) => {
@@ -438,19 +482,33 @@ async fn handle_pod_event(
                     return;
                 }
             };
+            let tracked_before = tracked_pods_summary(&tracker, port);
 
             if tracker.contains(pod_info) {
-                (false, tracker.len())
+                let tracked_after = tracked_pods_summary(&tracker, port);
+                (false, tracker.len(), tracked_before, tracked_after)
             } else {
                 tracker.insert(pod_info.clone());
-                (true, tracker.len())
+                let tracked_after = tracked_pods_summary(&tracker, port);
+                (true, tracker.len(), tracked_before, tracked_after)
             }
         };
 
+        debug!(
+            "Tracked pods update after healthy event: should_add={} | incoming={} | before={} | after={}",
+            should_add,
+            pod_info.summary(port),
+            tracked_before,
+            tracked_after
+        );
+
         if should_add {
             info!(
-                "Adding pod: {} | type: {:?} | url: {}",
-                pod_info.name, pod_info.pod_type, worker_url
+                "Adding pod: {} | type: {:?} | url: {} | {}",
+                pod_info.name,
+                pod_info.pod_type,
+                worker_url,
+                pod_info.summary(port)
             );
 
             let worker_type = if pd_mode {
@@ -506,7 +564,10 @@ async fn handle_pod_event(
             if let Some(job_queue) = app_context.worker_job_queue.get() {
                 match job_queue.submit(job).await {
                     Ok(_) => {
-                        debug!("Worker addition job submitted for: {}", worker_url);
+                        debug!(
+                            "Worker addition job submitted for: {} | tracked_count={}",
+                            worker_url, tracked_count
+                        );
 
                         // Layer 4: Record successful registration from K8s discovery
                         Metrics::record_discovery_registration(
@@ -533,7 +594,13 @@ async fn handle_pod_event(
                         );
 
                         if let Ok(mut tracker) = tracked_pods.lock() {
-                            tracker.remove(pod_info);
+                            let removed = tracker.remove(pod_info);
+                            debug!(
+                                "Rolled back tracked pod after AddWorker submit failure: removed={} | incoming={} | tracked_pods={}",
+                                removed,
+                                pod_info.summary(port),
+                                tracked_pods_summary(&tracker, port)
+                            );
                         }
                     }
                 }
@@ -545,11 +612,21 @@ async fn handle_pod_event(
             }
         } else {
             // Pod already tracked - this is a duplicate event
+            debug!(
+                "Pod already tracked; skipping AddWorker: {} | tracked_pods={}",
+                pod_info.summary(port),
+                tracked_after
+            );
             Metrics::record_discovery_registration(
                 metrics_labels::DISCOVERY_KUBERNETES,
                 metrics_labels::REGISTRATION_DUPLICATE,
             );
         }
+    } else {
+        info!(
+            "Pod event is not healthy; skipping AddWorker and leaving tracked_pods unchanged: {}",
+            pod_info.summary(port)
+        );
     }
 }
 
@@ -561,8 +638,10 @@ async fn handle_pod_deletion(
 ) {
     let worker_url = pod_info.worker_url(port);
 
+    debug!("Handling pod deletion: {}", pod_info.summary(port));
+
     // Remove pod and get remaining count in single lock acquisition
-    let (was_tracked, remaining_count) = {
+    let (was_tracked, remaining_count, tracked_before, tracked_after) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -570,14 +649,27 @@ async fn handle_pod_deletion(
                 return;
             }
         };
+        let tracked_before = tracked_pods_summary(&tracked, port);
         let removed = tracked.remove(pod_info);
-        (removed, tracked.len())
+        let tracked_after = tracked_pods_summary(&tracked, port);
+        (removed, tracked.len(), tracked_before, tracked_after)
     };
+
+    debug!(
+        "Tracked pods update after deletion event: was_tracked={} | incoming={} | before={} | after={}",
+        was_tracked,
+        pod_info.summary(port),
+        tracked_before,
+        tracked_after
+    );
 
     if was_tracked {
         info!(
-            "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Removing pod: {} | type: {:?} | url: {} | {}",
+            pod_info.name,
+            pod_info.pod_type,
+            worker_url,
+            pod_info.summary(port)
         );
 
         let job = Job::RemoveWorker {
@@ -613,8 +705,13 @@ async fn handle_pod_deletion(
         }
     } else {
         debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {} | incoming={} | before={} | after={}",
+            pod_info.name,
+            pod_info.pod_type,
+            worker_url,
+            pod_info.summary(port),
+            tracked_before,
+            tracked_after
         );
     }
 }
