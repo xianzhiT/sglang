@@ -465,6 +465,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                debug!(
+                    "Cache-aware selected worker {} (match_rate={:.2}, load={})",
+                    workers[idx].url(),
+                    match_rate,
+                    workers[idx].load()
+                );
+
                 return Some(idx);
             }
 
