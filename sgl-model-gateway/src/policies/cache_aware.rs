@@ -325,20 +325,50 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced. If multiple workers have the
-        // same load, randomize among them to avoid always picking index 0.
+        // Use bounded cache affinity when imbalanced: stay within the same
+        // load slack that defines "balanced", but do not discard useful cache
+        // locality inside that near-min-load window.
         let min_load = healthy_indices
             .iter()
             .map(|&idx| workers[idx].load())
             .min()
             .unwrap_or(0);
-        let min_load_workers: Vec<usize> = healthy_indices
+        let min_load_worker_indices: Vec<usize> = healthy_indices
             .iter()
             .filter(|&&idx| workers[idx].load() == min_load)
             .copied()
             .collect();
         let mut rng = rand::rng();
-        let min_load_idx = min_load_workers[rng.random_range(0..min_load_workers.len())];
+        let min_load_idx =
+            min_load_worker_indices[rng.random_range(0..min_load_worker_indices.len())];
+
+        let selected_idx = request_text
+            .and_then(|text| {
+                let tree = self
+                    .trees
+                    .get(tree_key)
+                    .map(|entry| entry.value().clone())?;
+                let max_near_min_load = min_load.saturating_add(self.config.balance_abs_threshold);
+
+                healthy_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| workers[idx].load() <= max_near_min_load)
+                    .filter_map(|idx| {
+                        let matched_chars = tree
+                            .prefix_match_tenant(text, workers[idx].url())
+                            .chars()
+                            .count();
+                        (matched_chars > 0).then_some((idx, matched_chars, workers[idx].load()))
+                    })
+                    .max_by(|a, b| {
+                        a.1.cmp(&b.1)
+                            .then_with(|| b.2.cmp(&a.2))
+                            .then_with(|| b.0.cmp(&a.0))
+                    })
+                    .map(|(idx, _, _)| idx)
+            })
+            .unwrap_or(min_load_idx);
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -347,7 +377,7 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
+                let worker_url = workers[selected_idx].url();
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
@@ -374,9 +404,9 @@ impl CacheAwarePolicy {
         }
 
         // Increment processed counter
-        workers[min_load_idx].increment_processed();
+        workers[selected_idx].increment_processed();
 
-        Some(min_load_idx)
+        Some(selected_idx)
     }
 }
 
@@ -677,6 +707,113 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_imbalanced_load_prefers_near_min_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 4,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+
+        let min_load_worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let near_min_cache_worker = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let overloaded_cache_worker = BasicWorkerBuilder::new("http://w3:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        for _ in 0..3 {
+            near_min_cache_worker.increment_load();
+        }
+        for _ in 0..20 {
+            overloaded_cache_worker.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(min_load_worker),
+            Arc::new(near_min_cache_worker),
+            Arc::new(overloaded_cache_worker),
+        ];
+        policy.init_workers(&workers);
+
+        let tree_key = tree_key_for_worker(workers[0].as_ref());
+        let tree = policy
+            .trees
+            .get(&tree_key)
+            .expect("regular worker tree should be initialized")
+            .clone();
+        tree.insert("shared prefix with moderate reuse", "http://w2:8000");
+        tree.insert(
+            "shared prefix with moderate reuse plus overloaded-only suffix",
+            "http://w3:8000",
+        );
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix with moderate reuse and new suffix"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(idx, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_imbalanced_load_ignores_overloaded_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 4,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+
+        let min_load_worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let overloaded_cache_worker = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        for _ in 0..20 {
+            overloaded_cache_worker.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> =
+            vec![Arc::new(min_load_worker), Arc::new(overloaded_cache_worker)];
+        policy.init_workers(&workers);
+
+        let tree_key = tree_key_for_worker(workers[0].as_ref());
+        let tree = policy
+            .trees
+            .get(&tree_key)
+            .expect("regular worker tree should be initialized")
+            .clone();
+        tree.insert("shared prefix with high reuse", "http://w2:8000");
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared prefix with high reuse and new suffix"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(idx, 0);
     }
 
     #[tokio::test]
